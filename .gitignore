@@ -1,0 +1,56 @@
+# Local environments, editor state, and credentials
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.idea/
+.vscode/
+.codex/
+.agents/
+.aws/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credentials*.json
+
+# Patient data, identifiers, predictions, and local experiment artifacts
+/data/
+/prepared/
+/splits/
+/runs/
+/evaluations/
+/outputs/*
+!/outputs/figures/
+/metadata/
+/nsclc_radiomics/
+/CV works/
+/doctor.json
+/self_test.json
+/environment*.json
+/environment-lock.txt
+*.dcm
+*.nii
+*.nii.gz
+*.nrrd
+*.mha
+*.mhd
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+*.hdf5
+*.log
+*.tmp
+*.tmp-*
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
