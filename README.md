@@ -18,6 +18,10 @@ patient-level cancer diagnosis or clinical suitability.
 | `docs/USER_GUIDE.md` | Detailed architecture explanations and command reference |
 | `docs/RESULTS.md` | Recorded experiment configuration, results, and limitations |
 | `docs/REVIEW.md` | Release review findings and verification scope |
+| `docs/TRAINING_IMPROVEMENTS.md` | Existing paths, cache recovery, sampling controls, measured probes |
+| `docs/EXPERIMENTS.md` | Controlled baseline/full/removal plans for three seeds |
+| `docs/EVALUATION.md` | Failure accounting, frozen postprocessing, paired comparisons |
+| `scripts/` | Read-only data audit, verified cache recovery, experiment planning |
 | `.github/workflows/tests.yml` | CPU checks on Python 3.11 and 3.12 |
 
 Local datasets, predictions, runs, checkpoints, and older notebooks in `CV works/`
@@ -50,6 +54,13 @@ Dependencies are compatibility ranges, not a lockfile; retain exact versions
 from `doctor` and each run's `environment.json` for reproducibility.
 
 ## Data and workflow
+
+The deleted processed cache has been restored for all 413 cases from the existing
+raw data, retaining the original manifest/split identities. The restored-cache
+audit passed, including 12 raw geometry rechecks.
+[Current improvements and commands](docs/TRAINING_IMPROVEMENTS.md) describe the
+verified paths, sampling controls, and historical recovery workflow.
+No further training should be started without the user's instruction.
 
 Obtain [NSCLC-Radiomics](https://www.cancerimagingarchive.net/collection/nsclc-radiomics/)
 separately and retain its citation and usage terms. Supported inputs are paired
@@ -100,6 +111,12 @@ score is an optimized development score, not an independent performance estimate
 Test HD95 was 110.00 mm and Surface Dice was 0.2584, so substantial segmentation
 errors remain. No postprocessing was applied. See [results and limitations](docs/RESULTS.md).
 
+The corrected 100-epoch run reached validation Dice 0.3774 at threshold 0.5 and
+0.4761 at validation-selected threshold 0.98 without component removal. The matched
+previous-model score at 0.98 is 0.4648; the paired confidence interval includes
+zero, so this is not an established improvement. No corrected-model test result
+is claimed. See the [matched validation study](docs/RESULTS.md#corrected-run-validation-study-7-november-2026).
+
 Surface metrics use six-neighbour boundary voxel centres and unweighted pooled
 distances, not surfel-area weighting. Empty-surface distances are reported as
 null with explicit counts. Compare methods using the same metric convention.
@@ -112,14 +129,15 @@ committing. Avoid `git add -f` for excluded artifacts.
 
 ```powershell
 git status --short
-git add README.md requirements.txt lung_ct_segmentation.py .gitignore .gitattributes docs tests .github
+git add README.md requirements.txt lung_ct_segmentation.py CODEX_PROJECT_KNOWLEDGE.md .gitignore .gitattributes docs tests scripts .github
 git diff --cached --stat
 git commit -m "Prepare MSF-HSAT research implementation and tests"
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git
+git remote -v
 git push -u origin main
 ```
 
-Create an empty GitHub repository first and replace the remote URL. Aggregate
+This local repository already has an `origin`; inspect it before pushing. For a
+new clone without one, add your own empty GitHub repository as `origin`. Aggregate
 results are documented without patient images, per-patient identifiers, or local
 source paths. No code licence is assigned here; the owner should choose an
 appropriate licence before granting reuse rights. Dataset terms remain separate.

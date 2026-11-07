@@ -1,7 +1,10 @@
 # CODEX KNOWLEDGE BASE: MSF-HSAT 3D LUNG TUMOR SEGMENTATION
 
 > **Instructions for Codex / AI Assistants:**
-> This document is the single source of truth for the **MSF-HSAT** repository (`d:\CV`). Ingest this file completely to obtain full domain, architectural, mathematical, algorithmic, empirical, and operational context. Follow all guidelines, invariants, and coding conventions described herein when modifying, extending, or reasoning about this codebase.
+> This document is an overview of the **MSF-HSAT** repository (`d:\CV`). The
+> current source code, recorded configurations, and verified artifacts take
+> precedence over prose summaries. See `docs/TRAINING_IMPROVEMENTS.md` and
+> `docs/EVALUATION.md` for the corrected training/evaluation workflow.
 
 ---
 
@@ -158,7 +161,7 @@ Input Patch: (B, 2, D, H, W)
 | **E1** | $(32, 32, 48, 48)$ | Downsampling Residual Block | Stride $(1, 2, 2)$; downsamples in-plane while preserving axial slice details |
 | **E2** | $(64, 16, 24, 24)$ | `MultiScaleResidual` | Stride $(2, 2, 2)$; parallel depthwise $3\text{D}$ convs with dilations $d \in \{1, 2, 3\}$ |
 | **E3** | $(128, 8, 12, 12)$ | `MultiScaleResidual` | Stride $(2, 2, 2)$; parallel depthwise $3\text{D}$ convs with dilations $d \in \{1, 2, 3\}$ |
-| **E4** | $(192, 4, 6, 6)$ | Dense Residual Block | Stride $(2, 2, 2)$; deep semantic feature extraction |
+| **E4** | $(192, 4, 6, 6)$ | Residual blocks | Stride $(2, 2, 2)$; deep semantic feature extraction |
 | **T (Bottleneck)**| $(192, 4, 6, 6)$ | `BottleneckTransformer` | 2 blocks, 8 heads, 3D sinusoidal coordinate embeddings, scaled dot-product attention |
 | **E3 Skips** | 8 bands $\times 128$ ch | `Haar3D` + Detail Gating | LLL passed to `WindowAttention3D`; 7 detail bands dynamically gated by $U_3$ and $q_3$ |
 | **E2 Skips** | 8 bands $\times 64$ ch | `Haar3D` + Detail Gating | LLL passed to `WindowAttention3D`; 7 detail bands dynamically gated by $U_2$ and $q_2$ |
@@ -173,7 +176,7 @@ Input Patch: (B, 2, D, H, W)
    Fixed orthonormal filters $L = [1, 1]/\sqrt{2}$ and $H = [1, -1]/\sqrt{2}$ yield 8 directional bands:
    $$\{LLL, LLH, LHL, LHH, HLL, HLH, HHL, HHH\} \quad (\text{order: } z, y, x)$$
 2. **Low-Frequency Attention (`WindowAttention3D`):**
-   The $LLL$ coarse band passes through shifted window multi-head self-attention with window size $(4, 6, 6)$ and 4 heads.
+   The $LLL$ coarse band passes through window multi-head self-attention with window size $(4, 6, 6)$ and 4 heads. Windows are not shifted.
 3. **Conditioned High-Frequency Detail Gating:**
    For each detail band $H_b$:
    $$R_b = H_b + \delta_b(H_b)$$
@@ -181,7 +184,7 @@ Input Patch: (B, 2, D, H, W)
    $$\widetilde{H}_b = g_b \cdot R_b$$
    - $U_i$: Top-down decoder context from deeper stage.
    - $q_i$: 9-dimensional normalized acquisition descriptor:
-     $$q_i = \big[\log(\text{native\_spacing}),\, \log(\text{target\_spacing} / \text{native\_spacing}),\, \log(\text{stage\_stride}_i)\big]$$
+     $$q_i = \big[\log(\text{native\_spacing}),\, \log(\text{target\_spacing} / \text{native\_spacing}),\, \log(\text{target\_spacing}\cdot\text{stage\_stride}_i)\big]$$
 4. **Inverse Haar Synthesis & Bounded Residual Injection:**
    After 3D inverse Haar transform:
    $$S_i = E_i + \sigma(\kappa_i) \cdot \text{Conv}_{1\times 1\times 1}(\text{Reconstructed} - E_i)$$
@@ -219,21 +222,21 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{main}} + \lambda_{\text{ds}}\B
 
 ## 6. Empirical Benchmarks & Verified Results
 
-The local reference run (`hybrid_compact_v2_seed42`) completed all 100 epochs on an NVIDIA RTX 5050 Laptop GPU (10h 36m total compute time).
+The local reference run (`hybrid_compact_v2_seed42`) completed all 100 epochs on an NVIDIA RTX 5050 Laptop GPU. Summed history components are about 4.12 hours training plus 7.35 hours validation; these are logged components, not a fresh elapsed-time benchmark.
 
 ### 6.1. Official Validation and Test Results
 
 | Evaluation Split | Checkpoint | Threshold | Mean Dice | Median Dice | Precision | Recall | HD95 (mm) | Surface Dice (2mm) |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
 | **Validation (83 cases)** | Epoch 90 (`best.pt`) | 0.50 (raw) | 0.3563 | 0.3639 | 0.2691 | **0.7264** | 165.39 | 0.2253 |
-| **Validation (Optimized)** | Epoch 90 (`best.pt`) | 0.98 (tuned) | **0.4648** | 0.4851 | 0.5412 | 0.5011 | 98.42 | 0.2915 |
+| **Validation (Threshold search)** | Epoch 90 (`best.pt`) | 0.98 (tuned) | **0.4648** | not recorded by threshold search | not recorded | not recorded | not recorded | not recorded |
 | **Held-out Test (83 cases)** | Epoch 90 (`best.pt`) | **0.98 (frozen)** | **0.4217** | **0.4403** | **0.4925** | 0.4586 | **110.00** | **0.2584** |
 
 ### 6.2. Empirical Observations & Behavior
-1. **Zero Complete Misses:** Out of 83 validation and 83 test patients, complete miss count is exactly 0. The model never fails to localize a lesion.
+1. **Zero Empty-Prediction Misses:** The historical `complete_miss` count is 0. This only means positive-reference scans had nonempty predictions. A nonempty prediction can have zero overlap with the tumour. Updated evaluation reports empty predictions, zero-overlap cases, and nonempty disjoint cases separately.
 2. **Prominent Tumor Accuracy:** On large, distinct lesions (e.g., `LUNG1-396`, `LUNG1-042`, `LUNG1-228`), the model achieves Dice scores between **0.75 and 0.78**.
-3. **Threshold Sensitivity:** At threshold 0.5, the model exhibits high recall (~73-84%) but low precision (~27%), caused by swollen boundaries. Shifting the threshold to 0.98 filters out low-confidence false positives, raising mean test Dice to 0.4217.
-4. **HD95 Artifacts:** High HD95 (~110 mm) is driven by small, isolated false-positive voxel clusters in contralateral lungs or diaphragmatic edges.
+3. **Threshold Sensitivity:** Validation at 0.5 had recall about 73% and precision about 27%. Validation-selected 0.98 gave development Dice 0.4648; test at that frozen threshold gave Dice 0.4217. These are operating-point changes, not newly trained weight improvements.
+4. **HD95:** Test HD95 is about 110 mm. Determining whether distant islands, boundary errors, or missed targets drive it requires examining actual predictions; the aggregate alone does not establish the cause.
 
 ---
 
@@ -338,6 +341,6 @@ When writing code, refactoring, or generating modules for this repository, Codex
    - Always protect entry points with `multiprocessing.freeze_support()`.
    - Default `workers=0` on Windows DataLoader invocations to avoid inter-process handle locking issues.
 7. **Suggested Immediate Enhancements:**
-   - **Post-Processing (Connected Component Filtering):** Implement 3D Connected Component Analysis (`scipy.ndimage.label`) to discard small secondary islands (< 100 voxels) or retain only the largest component. This will reduce HD95 from 110 mm to < 20 mm without harming Dice.
-   - **Balanced Preset Training:** Train a `balanced` preset (`patch = (48, 128, 128)`, `widths = (16, 32, 64, 128, 192)`) with `--lambda-boundary 0.3` to tighten boundary precision directly at training time.
+   - **Post-Processing:** `select-threshold` can select connected-component recipes on validation and freeze them with the checkpoint. Filtering can remove true targets and does not guarantee a Dice or HD95 improvement.
+   - **Physical Context:** Compare `balanced` patches `(48,128,128)` only after a real-patch memory preflight. Change context independently of loss weights before drawing conclusions. See the controlled plans for matching model budgets and seeds.
 

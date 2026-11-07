@@ -967,12 +967,19 @@ class PatchDataset(Dataset):
     each epoch, so a stale persistent-worker copy cannot silently keep epoch zero.
     """
     def __init__(self, records, base, stats, patch, channels, samples, seed, epoch,
-                 foreground_probability=.5, augment=True, max_open_cases=2, metadata_control="normal"):
+                 foreground_probability=.5, augment=True, max_open_cases=2, metadata_control="normal",
+                 anatomical_background_probability=0., hard_negative_probability=0., hard_negatives=None):
         self.records, self.base, self.stats = records, str(base), stats
         self.patch, self.channels, self.samples = tuple(patch), channels, samples
         self.seed, self.epoch, self.foreground_probability = seed, epoch, foreground_probability
         self.augment, self.max_open_cases = augment, max_open_cases
         self.metadata_control = metadata_control
+        self.anatomical_probability = anatomical_background_probability
+        self.hard_probability = hard_negative_probability
+        self.hard_negatives = hard_negatives or {}
+        probabilities = (foreground_probability, anatomical_background_probability, hard_negative_probability)
+        if any(not math.isfinite(p) or p < 0 for p in probabilities) or sum(probabilities) > 1 + 1e-9:
+            raise UserError("Sampling probabilities must be finite, nonnegative, and sum to at most one.")
         self._open = OrderedDict()
         self._q = []
         for r in records:
@@ -999,9 +1006,24 @@ class PatchDataset(Dataset):
         rng = indexed_rng(self.seed, self.epoch, index)
         selected = int(rng.integers(len(self.records)))
         if selected not in self._open:
-            directory, _ = cache_path(self.base, self.records[selected])
+            directory, metadata = cache_path(self.base, self.records[selected])
             arrays = {key: np.load(directory / f"{key}.npy", mmap_mode="r", allow_pickle=False)
                       for key in ("hu", "mask", "boundary", "fg_indices")}
+            if self.anatomical_probability:
+                # Include nearby soft tissue as well as lung-like HU: sampling
+                # only aerated lung neglects mediastinal false positives. This
+                # image-derived region never uses a target for localization.
+                coarse = arrays["hu"][::4, ::8, ::8]
+                lung_like = (coarse >= -950) & (coarse <= -250)
+                if lung_like.any():
+                    coarse_spacing = np.asarray(metadata["target_spacing_zyx_mm"]) * (4, 8, 8)
+                    near_lung = require("scipy.ndimage").distance_transform_edt(
+                        ~lung_like, sampling=coarse_spacing) <= 24.
+                    eligible = near_lung & (coarse >= -950) & (coarse <= 300)
+                else:
+                    eligible = np.zeros_like(lung_like)
+                coords = np.argwhere(eligible)
+                arrays["anatomical_centres"] = coords * np.asarray((4, 8, 8))
             self._open[selected] = arrays
             while len(self._open) > self.max_open_cases:
                 _, expired = self._open.popitem(last=False)
@@ -1010,10 +1032,34 @@ class PatchDataset(Dataset):
                         value._mmap.close()
         self._open.move_to_end(selected)
         a = self._open[selected]
-        if len(a["fg_indices"]) and rng.random() < self.foreground_probability:
-            center = np.asarray(np.unravel_index(int(rng.choice(a["fg_indices"])), a["mask"].shape))
+        kind, fallback = "uniform", False
+        if not self.anatomical_probability and not self.hard_probability:
+            # Preserve the exact old RNG sequence when new sampling is disabled.
+            if len(a["fg_indices"]) and rng.random() < self.foreground_probability:
+                kind = "foreground"
+                center = np.asarray(np.unravel_index(int(rng.choice(a["fg_indices"])), a["mask"].shape))
+            else:
+                center = np.asarray([rng.integers(n) for n in a["hu"].shape])
         else:
-            center = np.asarray([rng.integers(n) for n in a["hu"].shape])
+            draw = rng.random()
+            if draw < self.foreground_probability and len(a["fg_indices"]):
+                kind = "foreground"
+                center = np.asarray(np.unravel_index(int(rng.choice(a["fg_indices"])), a["mask"].shape))
+            elif draw < self.foreground_probability + self.anatomical_probability:
+                kind = "anatomical_background"
+                center = self.background_center(a, a.get("anatomical_centres", ()), rng)
+                fallback = center is None
+            elif draw < self.foreground_probability + self.anatomical_probability + self.hard_probability:
+                kind = "hard_negative"
+                candidates = self.hard_negatives.get(self.records[selected]["case_id"], ())
+                center = self.background_center(a, candidates, rng)
+                fallback = center is None
+            else:
+                center = None
+            if center is None:
+                center = np.asarray([rng.integers(n) for n in a["hu"].shape])
+                if fallback:
+                    kind = "uniform_fallback"
         start = center - np.asarray(self.patch) // 2
         hu = extract_patch(a["hu"], start, self.patch, -1024.)
         mask = extract_patch(a["mask"], start, self.patch)
@@ -1027,13 +1073,61 @@ class PatchDataset(Dataset):
         return {"image": torch.from_numpy(windows_from_hu(hu, self.channels).copy()),
                 "mask": torch.from_numpy(mask[None].astype(np.float32)),
                 "boundary": torch.from_numpy(band[None].astype(np.float32)),
-                "q": torch.from_numpy(q)}
+                "q": torch.from_numpy(q), "sampling_kind": kind,
+                "sampling_fallback": fallback, "contains_foreground": bool(mask.any()),
+                "foreground_fraction": float(mask.mean())}
+
+    def background_center(self, arrays, candidates, rng):
+        """Try bounded training-background centres; never silently promise negatives."""
+        if not len(candidates):
+            return None
+        for _ in range(24):
+            center = np.asarray(candidates[int(rng.integers(len(candidates)))], dtype=int)
+            start = center - np.asarray(self.patch) // 2
+            bounds = tuple(slice(max(0, int(s)), min(n, int(s) + p))
+                           for s, p, n in zip(start, self.patch, arrays["mask"].shape))
+            if not arrays["mask"][bounds].any():
+                return center
+        return None
 
 
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     random.seed(worker_seed)
     np.random.seed(worker_seed)
+
+
+def load_hard_negative_index(path, manifest, split, records, base):
+    """Only accept bounded working-grid centres from this training partition."""
+    if not path:
+        return {}, None
+    saved = load_json(path)
+    fingerprint = stable_hash({k: v for k, v in saved.items() if k != "fingerprint"})
+    if (saved.get("fingerprint") != fingerprint or saved.get("source_partition") != "train"
+            or saved.get("manifest_fingerprint") != manifest["fingerprint"]
+            or saved.get("split_fingerprint") != split["fingerprint"]
+            or saved.get("coordinate_grid") != "working_zyx"):
+        raise UserError("Hard negatives must be fingerprinted training-only predictions for this manifest/split.")
+    train_ids = set(split["partitions"]["train"])
+    if not set(saved.get("cases", {})).issubset(train_ids):
+        raise UserError("Hard-negative index includes non-training patients.")
+    result = {}
+    for record in records:
+        item = saved.get("cases", {}).get(record["case_id"])
+        if item is None:
+            continue
+        _, metadata = cache_path(base, record)
+        shape = metadata["working_shape_zyx"]
+        if item.get("shape_zyx") != shape:
+            raise UserError("Hard-negative coordinates use a different working grid.")
+        centres = np.asarray(item["centres_zyx"])
+        if centres.size == 0:
+            continue
+        if (centres.ndim != 2 or centres.shape[1] != 3 or not np.issubdtype(centres.dtype, np.integer)
+                or (centres < 0).any() or (centres >= np.asarray(shape)).any()):
+            raise UserError("Invalid hard-negative working-grid coordinates.")
+        result[record["case_id"]] = centres.astype(np.int64)
+    return result, fingerprint
 
 
 # 04. Residual, multiscale, transformer, and wavelet building blocks -----------
@@ -1507,6 +1601,48 @@ def total_loss(output, target, band, lambda_ds=1., lambda_boundary=.1):
 
 
 # 06. Physical complete-volume metrics and population summaries ----------------
+def postprocessing_recipe(recipe="none", min_volume_ml=0.):
+    """Normalize legacy string and versioned native-grid component recipes."""
+    if isinstance(recipe, dict):
+        mode = recipe.get("mode", "none")
+        minimum = recipe.get("min_volume_ml", 0.)
+        if recipe.get("connectivity", 6) != 6 or recipe.get("grid", "native") != "native":
+            raise UserError("Only native-grid six-neighbour postprocessing recipes are supported.")
+    else:
+        mode, minimum = recipe, min_volume_ml
+    if mode not in ("none", "largest", "min-volume"):
+        raise UserError("Postprocessing must be none, largest, or min-volume.")
+    minimum = float(minimum)
+    if not math.isfinite(minimum) or minimum < 0 or (mode == "min-volume" and minimum <= 0):
+        raise UserError("min-volume postprocessing requires a positive finite volume in mL.")
+    return {"mode": mode, "min_volume_ml": minimum if mode == "min-volume" else 0.,
+            "connectivity": 6, "grid": "native"}
+
+
+def postprocess_prediction(mask, spacing, mode="none", min_volume_ml=0.):
+    """Filter binary components on the native grid, without a reference mask.
+
+    Largest-component ties select the first component in array traversal order.
+    Physical minimum-volume filtering retains every component meeting the cutoff.
+    """
+    recipe = postprocessing_recipe(mode, min_volume_ml)
+    spacing = positive_spacing(spacing)
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 3:
+        raise UserError("Postprocessing expects a 3D native-grid mask.")
+    if recipe["mode"] == "none" or not mask.any():
+        return mask.copy()
+    ndi = require("scipy.ndimage")
+    labels, count = ndi.label(mask, structure=ndi.generate_binary_structure(3, 1))
+    sizes = np.bincount(labels.ravel(), minlength=count + 1)
+    sizes[0] = 0
+    if recipe["mode"] == "largest":
+        return labels == int(np.argmax(sizes))
+    keep = sizes * float(np.prod(spacing) / 1000) >= recipe["min_volume_ml"]
+    keep[0] = False
+    return keep[labels]
+
+
 def evaluate_arrays(prediction, reference, spacing, tolerance_mm=2.):
     """Voxel-center surfaces with 6-neighbor erosion, unweighted pooled distances.
 
@@ -1516,7 +1652,7 @@ def evaluate_arrays(prediction, reference, spacing, tolerance_mm=2.):
     ndi = require("scipy.ndimage")
     spacing = positive_spacing(spacing)
     pred, ref = np.asarray(prediction, dtype=bool), np.asarray(reference, dtype=bool)
-    if pred.shape != ref.shape:
+    if pred.ndim != 3 or ref.ndim != 3 or pred.shape != ref.shape:
         raise UserError("Metric arrays have different grids.")
     if tolerance_mm <= 0:
         raise UserError("Surface tolerance must be positive in mm.")
@@ -1533,6 +1669,9 @@ def evaluate_arrays(prediction, reference, spacing, tolerance_mm=2.):
               "absolute_relative_volume_error": abs(p - r) / r if r else None,
               "false_positive_volume_ml": fp * voxel_ml, "false_negative_volume_ml": fn * voxel_ml,
               "complete_miss": int(r > 0 and p == 0), "reference_positive": int(r > 0),
+              "empty_prediction": int(p == 0), "both_empty": int(p == 0 and r == 0),
+              "zero_overlap": int(r > 0 and tp == 0),
+              "disjoint_nonempty_prediction": int(r > 0 and p > 0 and tp == 0),
               "hd95_mm": None, "assd_mm": None, "surface_dice": None,
               "surface_tolerance_mm": tolerance_mm,
               "surface_convention": "6-neighbor boundary voxel centers; pooled unweighted distances"}
@@ -1567,18 +1706,34 @@ def evaluate_arrays(prediction, reference, spacing, tolerance_mm=2.):
 def bootstrap_summary(rows, seed=1234, repeats=1000):
     """One resampling unit per patient; multiple series average within their patient first."""
     valid_rows = [r for r in rows if r.get("status", "success") == "success"]
+    # Infer the new accounting fields for historical metrics without rewriting
+    # their files. A nonempty but disjoint prediction is NOT an empty prediction.
+    def indicator(row, key):
+        if key in row:
+            return int(row[key])
+        p, r, dice = row.get("predicted_volume_ml"), row.get("reference_volume_ml"), row.get("dice")
+        if p is None or r is None:
+            return 0
+        return int({"empty_prediction": p == 0, "both_empty": p == 0 and r == 0,
+                    "zero_overlap": r > 0 and dice == 0,
+                    "disjoint_nonempty_prediction": p > 0 and r > 0 and dice == 0}[key])
     result = {"attempted_cases": len(rows), "successful_cases": len(valid_rows),
               "technical_failures": len(rows) - len(valid_rows),
               "complete_miss_cases": sum(int(r.get("complete_miss", 0)) for r in valid_rows),
-              "nonfinite_surface_cases": sum(r.get("surface_status") != "finite" for r in valid_rows),
-              "bootstrap_unit": "patient; case values averaged within patient", "metrics": {}}
+              "nonfinite_surface_cases": sum(r.get("surface_status") in ("both_empty", "one_empty_infinite_distance") for r in valid_rows),
+              "unknown_surface_status_cases": sum(r.get("surface_status") is None for r in valid_rows),
+              "bootstrap_unit": "patient; case values averaged within patient",
+              "failure_policy": "Technical failures are counted, retained in patient records, and excluded from available-case metric means; training checkpoint selection rejects any technical failure.",
+              "metrics": {}}
+    for key in ("empty_prediction", "both_empty", "zero_overlap", "disjoint_nonempty_prediction"):
+        result[key + "_cases"] = sum(indicator(row, key) for row in valid_rows)
     for metric in ("dice", "iou", "precision", "recall", "hd95_mm", "assd_mm", "surface_dice",
                    "absolute_relative_volume_error", "inference_seconds", "peak_cuda_gib"):
         grouped = {}
         for row in valid_rows:
             value = row.get(metric)
             if value is not None and math.isfinite(float(value)):
-                grouped.setdefault(row.get("patient_id", row["case_id"]), []).append(float(value))
+                grouped.setdefault(row.get("patient_id") or row["case_id"], []).append(float(value))
         values = np.asarray([np.mean(v) for v in grouped.values()], dtype=float)
         if not len(values):
             result["metrics"][metric] = {"n_patients": 0, "mean": None, "ci95": None}
@@ -1753,19 +1908,26 @@ def load_inference_model(path, device):
     return model, saved
 
 
-def export_prediction(directory, probability_image, threshold):
+def export_prediction(directory, probability_image, threshold, prediction=None):
     sitk = require("SimpleITK")
     directory.mkdir(parents=True, exist_ok=True)
     sitk.WriteImage(probability_image, str(directory / "probability.nii.gz"), True)
-    mask = sitk.Cast(probability_image >= threshold, sitk.sitkUInt8)
+    if prediction is None:
+        mask = sitk.Cast(probability_image >= threshold, sitk.sitkUInt8)
+    else:
+        mask = sitk.GetImageFromArray(np.asarray(prediction, dtype=np.uint8))
+        if mask.GetSize() != probability_image.GetSize():
+            raise UserError("Exported prediction and probability grids differ.")
+        mask.CopyInformation(probability_image)
     sitk.WriteImage(mask, str(directory / "prediction.nii.gz"), True)
     return mask
 
 
 def evaluate_records(model, records, base, stats, patch, overlap, threshold, tolerance,
                      device, precision, output=None, metadata_control="normal", figure_cases=6,
-                     save_predictions=True, accumulator_dir=None):
+                     save_predictions=True, accumulator_dir=None, postprocessing="none"):
     sitk = require("SimpleITK")
+    recipe = postprocessing_recipe(postprocessing)
     rows, all_analysis = [], []
     if output is not None:
         output = Path(output)
@@ -1782,10 +1944,10 @@ def evaluate_records(model, records, base, stats, patch, overlap, threshold, tol
                     accumulator_dir=accumulator_dir)
                 native = native_probability(probability, metadata)
                 native_array = sitk.GetArrayFromImage(native)
-                pred = native_array >= threshold
+                pred = postprocess_prediction(native_array >= threshold, metadata["native_spacing_zyx_mm"], recipe)
                 row.update({k: v for k, v in timing.items() if k != "analysis"})
                 row.update({"native_spacing_z_mm": metadata["native_spacing_zyx_mm"][0],
-                            "threshold": threshold, "postprocessing": "none"})
+                            "threshold": threshold, "postprocessing": recipe})
                 if record["annotation_status"] == "unlabeled":
                     row["metric_status"] = "no_reference"
                 else:
@@ -1808,16 +1970,21 @@ def evaluate_records(model, records, base, stats, patch, overlap, threshold, tol
                     case_out = output / "cases" / cid
                     case_out.mkdir(parents=True, exist_ok=True)
                     if save_predictions:
-                        export_prediction(case_out, native, threshold)
+                        export_prediction(case_out, native, threshold, pred)
                     atomic_json(case_out / "metadata.json", {"case": record, "geometry": metadata,
-                                "threshold": threshold, "logit_blending": "Gaussian sigma=patch/8; clipped min=1e-4",
+                                "threshold": threshold, "postprocessing": recipe,
+                                "logit_blending": "Gaussian sigma=patch/8; clipped min=1e-4",
                                 "timing_includes": "working-grid sliding windows and input transfer; excludes native export/metrics"})
                     if index < figure_cases:
                         working_ref = (np.load(directory / "mask.npy", mmap_mode="r", allow_pickle=False)
                                        if record["annotation_status"] != "unlabeled" else None)
                         try:
+                            native_mask = image_on_grid(pred.astype(np.uint8), metadata["native_grid"])
+                            working_mask = sitk.GetArrayFromImage(sitk.Resample(
+                                native_mask, empty_grid(metadata["working_grid"]), sitk.Transform(),
+                                sitk.sitkNearestNeighbor, 0., sitk.sitkUInt8)).astype(bool)
                             save_case_panels(hu, working_ref, probability, threshold, metadata["target_spacing_zyx_mm"],
-                                             case_out, cid)
+                                             case_out, cid, prediction_mask=working_mask)
                         finally:
                             if isinstance(working_ref, np.memmap):
                                 working_ref._mmap.close()
@@ -1856,6 +2023,7 @@ def inference_command(args):
     precision = resolve_precision(device, args.precision)
     threshold = saved["threshold"]
     threshold_source = saved["threshold_source"]
+    recipe = postprocessing_recipe("none")
     if args.operating_point:
         point = load_json(args.operating_point)
         fingerprint = stable_hash({k: v for k, v in point.items() if k != "fingerprint"})
@@ -1865,6 +2033,11 @@ def inference_command(args):
                 or point["manifest_fingerprint"] != saved["manifest_fingerprint"]):
             raise UserError("Operating point is not a compatible frozen validation selection for this checkpoint.")
         threshold, threshold_source = point["threshold"], "frozen validation selection: " + point["fingerprint"]
+        if not math.isfinite(threshold) or not 0 < threshold < 1:
+            raise UserError("Frozen operating threshold must be finite and in (0,1).")
+        recipe = postprocessing_recipe(point.get("postprocessing", "none"))
+        if "overlap" in point and args.overlap != point["overlap"]:
+            raise UserError("Inference overlap differs from the frozen validation operating point.")
     partition = "unlabeled"
     if args.command == "evaluate":
         split = validate_split(manifest, load_json(args.splits))
@@ -1898,7 +2071,7 @@ def inference_command(args):
                 "partition": partition, "case_ids": [r["case_id"] for r in records],
                 "target": manifest["settings"]["target_roi"],
                 "threshold": threshold, "threshold_source": threshold_source,
-                "postprocessing": "none", "surface_tolerance_mm": args.surface_tolerance_mm,
+                "postprocessing": recipe, "surface_tolerance_mm": args.surface_tolerance_mm,
                 "surface_convention": "6-neighbor boundary voxel centers; pooled unweighted distances",
                 "patch": saved["patch"], "overlap": args.overlap, "precision": precision,
                 "metadata_control": saved["metadata_control"], "parameters": sum(p.numel() for p in model.parameters()),
@@ -1912,7 +2085,7 @@ def inference_command(args):
     rows = evaluate_records(model, records, base, saved["acquisition_stats"], saved["patch"], args.overlap,
                  threshold, args.surface_tolerance_mm, device, precision, out,
                  saved["metadata_control"], args.figure_cases, not args.no_save_predictions,
-                 args.accumulator_dir)
+                 args.accumulator_dir, recipe)
     report_build(out, [out], args.figure_cases, args.dpi, args.vector, prepared_manifest=args.manifest)
     if any(r["status"] != "success" for r in rows):
         raise UserError(f"{sum(r['status'] != 'success' for r in rows)} cases failed; results retained in {out}.")
@@ -1941,8 +2114,9 @@ def model_config_from_args(args, preset):
     return config.validate()
 
 
-def preflight_model(config, patch, batch_size, device, precision, lambda_ds, lambda_boundary):
-    """Includes backward AND AdamW state allocation. Discard probe before real initialization."""
+def preflight_model(config, patch, batch_size, device, precision, lambda_ds, lambda_boundary,
+                    real_batch=None):
+    """Two full backward/AdamW steps, with real training patches when available."""
     started = time.perf_counter()
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -1951,23 +2125,38 @@ def preflight_model(config, patch, batch_size, device, precision, lambda_ds, lam
     try:
         model = SegmentationModel(config).to(device).train()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-        image = torch.rand((batch_size, config.channels, *patch), device=device)
-        target = torch.zeros((batch_size, 1, *patch), device=device)
-        q = torch.zeros((batch_size, 2, 9), device=device)
+        if real_batch is None:
+            image = torch.rand((batch_size, config.channels, *patch), device=device)
+            target = torch.zeros((batch_size, 1, *patch), device=device)
+            target[:, :, patch[0]//4:patch[0]//2, patch[1]//4:patch[1]//2, patch[2]//4:patch[2]//2] = 1
+            band = target
+            q = torch.zeros((batch_size, 2, 9), device=device)
+        else:
+            image, target, band, q = [real_batch[k].to(device) for k in ("image", "mask", "boundary", "q")]
         scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and precision == "fp16")
-        with autocast_context(device, precision):
-            output = model(image, q, True)
-            loss, _ = total_loss(output, target, target, lambda_ds, lambda_boundary)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context(device, precision):
+                output = model(image, q, True)
+                loss, _ = total_loss(output, target, band, lambda_ds, lambda_boundary)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 12.)
+            if not torch.isfinite(norm):
+                raise UserError("Nonfinite gradients during memory preflight.")
+            scaler.step(optimizer)
+            scaler.update()
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         return {"status": "passed", "patch": list(patch), "batch_size": batch_size,
                 "precision": precision, "seconds": time.perf_counter() - started,
                 "peak_cuda_gib": torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None,
                 "parameters": sum(p.numel() for p in model.parameters()),
-                "scope": "synthetic one-step allocation probe; not measured real-data throughput or accuracy"}
+                "optimizer_steps": 2, "target_foreground_fraction": float(target.float().mean().item()),
+                "gradient_norm": float(norm.item()),
+                "scope": ("two real-training-patch optimizer steps; allocation/finite-gradient probe, not accuracy"
+                          if real_batch is not None else
+                          "two synthetic positive-target optimizer steps; allocation probe, not real-data accuracy")}
     finally:
         del loss, output, image, target, optimizer, model
         if device.type == "cuda":
@@ -2013,6 +2202,15 @@ def validate_train_args(args):
             raise UserError(f"--{key.replace('_','-')} must be positive.")
     if args.workers < 0 or not 0 <= args.foreground_probability <= 1:
         raise UserError("Invalid workers or foreground probability.")
+    probabilities = [args.foreground_probability,
+                     getattr(args, "anatomical_background_probability", 0.),
+                     getattr(args, "hard_negative_probability", 0.)]
+    if any(not math.isfinite(p) or p < 0 for p in probabilities) or sum(probabilities) > 1 + 1e-9:
+        raise UserError("Foreground, anatomical-background, and hard-negative probabilities must sum to at most 1.")
+    if getattr(args, "hard_negative_probability", 0.) and not getattr(args, "hard_negative_index", None):
+        raise UserError("--hard-negative-probability requires a train-only --hard-negative-index.")
+    if getattr(args, "preflight_only", False) and args.resume:
+        raise UserError("Preflight-only is a new allocation diagnostic; do not combine it with --resume.")
     if args.lr <= 0 or args.weight_decay < 0 or args.lambda_ds < 0 or args.lambda_boundary < 0:
         raise UserError("Invalid optimizer/loss hyperparameter.")
     if not 0 < args.threshold < 1:
@@ -2042,6 +2240,15 @@ def train_command(args):
             raise UserError("Resume data/split fingerprint mismatch. Start a separately labeled new run.")
         if run != Path(resume["run_path"]).resolve():
             raise UserError("Resume must use the original --run directory (move the whole run only with care).")
+        # Missing fields in legacy checkpoints mean old sampling, never the
+        # current CLI's new settings. Explicit recipe changes require a new run.
+        for key, default in (("anatomical_background_probability", 0.), ("hard_negative_probability", 0.),
+                             ("hard_negative_index", None), ("preflight_only", False)):
+            if key not in resume["train_args"]:
+                flag = "--" + key.replace("_", "-")
+                if flag in args._provided and getattr(args, key) != default:
+                    raise UserError(f"Legacy resume cannot change {flag}; start a new run.")
+                setattr(args, key, default)
         # All scientific/optimization settings are restored. Explicit conflicting CLI
         # changes are rejected rather than silently ignored or applied halfway through.
         for key, value in resume["train_args"].items():
@@ -2064,6 +2271,14 @@ def train_command(args):
         validation_records = train_records
         args.no_augmentation = True
     stats = resume["acquisition_stats"] if resume else acquisition_statistics(train_records, base)
+    hard_negatives, hard_fingerprint = load_hard_negative_index(
+        getattr(args, "hard_negative_index", None), manifest, split, train_records, base)
+    if getattr(args, "hard_negative_probability", 0.) and not hard_negatives:
+        raise UserError("Hard-negative sampling requested but this training subset has no mined centres.")
+    if resume and resume.get("hard_negative_index_fingerprint") != hard_fingerprint:
+        raise UserError("Hard-negative index changed since this run was saved.")
+    implementation_sha256 = file_digest(Path(__file__))
+    normalization_version = resume.get("normalization_version", "legacy-saved") if resume else "float64-training-patients-v1"
     if resume:
         config = ModelConfig(**resume["model_config"])
         patch, preset = tuple(resume["patch"]), resume["preset"]
@@ -2081,10 +2296,18 @@ def train_command(args):
             if min(patch) < 8:
                 raise UserError("Training patches must be at least 8 voxels in each dimension.")
             try:
-                if args.preflight or args.preset == "auto":
+                if args.preflight or args.preset == "auto" or getattr(args, "preflight_only", False):
                     LOGGER.info("Preflight: %s, patch=%s, batch=%s", preset, patch, args.batch_size)
+                    probe_data = PatchDataset(train_records, base, stats, patch, candidate.channels,
+                        args.batch_size, args.seed, 0, foreground_probability=1., augment=False)
+                    try:
+                        probe_items = [probe_data[i] for i in range(args.batch_size)]
+                        real_batch = {key: torch.stack([r[key] for r in probe_items])
+                                      for key in ("image", "mask", "boundary", "q")}
+                    finally:
+                        probe_data.close()
                     result = preflight_model(candidate, patch, args.batch_size, device, precision,
-                                             args.lambda_ds, args.lambda_boundary)
+                                             args.lambda_ds, args.lambda_boundary, real_batch)
                 else:
                     result = {"status": "not_run", "reason": "--preflight not selected; fit is unverified"}
                 result["preset"] = preset
@@ -2131,6 +2354,9 @@ def train_command(args):
                 "manifest_fingerprint": manifest["fingerprint"], "split_fingerprint": split["fingerprint"],
                 "acquisition_stats": stats, "preflight": preflight,
                 "parameters": sum(p.numel() for p in model.parameters()),
+                "normalization_version": normalization_version, "implementation_sha256": implementation_sha256,
+                "hard_negative_index_fingerprint": hard_fingerprint,
+                "physical_patch_zyx_mm": (np.asarray(patch) * np.asarray(manifest["settings"]["spacing_zyx_mm"])).tolist(),
                 "selection_criterion": "mean per-patient full-volume validation Dice" if not args.overfit_cases else
                                        "mean training-case diagnostic full-volume Dice", "created": now()}
     atomic_json(run / "resolved_config.json", resolved)
@@ -2146,6 +2372,13 @@ def train_command(args):
                 "parameters": resolved["parameters"], "precision": precision, "patch": patch,
                 "overfit_cases": args.overfit_cases}
     atomic_json(run / "protocol.json", protocol)
+    if not resume:
+        shutil.copy2(Path(__file__), run / "implementation.py")
+    if getattr(args, "preflight_only", False):
+        atomic_json(run / "preflight_only.json", {"status": "passed", "preflight": preflight,
+                     "scope": "no training run or accuracy result; discarded probe model"})
+        print(f"Real-patch preflight passed: {run / 'resolved_config.json'}")
+        return 0
     def make_checkpoint(completed_epochs):
         return {"program_version": VERSION, "run_path": str(run), "model_config": dataclasses.asdict(config),
                 "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(),
@@ -2157,6 +2390,8 @@ def train_command(args):
                 "split_fingerprint": split["fingerprint"], "target": protocol["target"],
                 "threshold": args.threshold, "threshold_source": protocol["threshold_source"],
                 "metadata_control": args.metadata_control, "overfit_cases": args.overfit_cases,
+                "normalization_version": normalization_version, "implementation_sha256": implementation_sha256,
+                "hard_negative_index_fingerprint": hard_fingerprint,
                 "cohort_patient_ids": sorted({r["patient_id"] for r in manifest["records"]}),
                 "cohort_source_identities": sorted({r["source_identity"] for r in manifest["records"]})}
     if not resume:
@@ -2167,7 +2402,9 @@ def train_command(args):
             started = time.perf_counter()
             dataset = PatchDataset(train_records, base, stats, patch, config.channels,
                                    args.steps_per_epoch * args.batch_size, args.seed, epoch,
-                                   args.foreground_probability, not args.no_augmentation, 2, args.metadata_control)
+                                   args.foreground_probability, not args.no_augmentation, 2, args.metadata_control,
+                                   getattr(args, "anatomical_background_probability", 0.),
+                                   getattr(args, "hard_negative_probability", 0.), hard_negatives)
             loader_options = {"batch_size": args.batch_size, "num_workers": args.workers,
                               "pin_memory": device.type == "cuda", "shuffle": False, "drop_last": False,
                               "worker_init_fn": seed_worker,
@@ -2178,11 +2415,16 @@ def train_command(args):
             model.train()
             optimizer.zero_grad(set_to_none=True)
             sums = Counter()
+            sampling_counts, positive_patches, patch_foreground_sum, sampling_fallbacks = Counter(), 0, 0., 0
             gradient_norms, skipped_updates = [], 0
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
             progress = tqdm(loader, desc=f"epoch {epoch + 1}/{args.max_epochs}", unit="batch")
             for batch_index, batch in enumerate(progress):
+                sampling_counts.update(batch["sampling_kind"])
+                positive_patches += int(batch["contains_foreground"].sum().item())
+                patch_foreground_sum += float(batch["foreground_fraction"].sum().item())
+                sampling_fallbacks += int(batch["sampling_fallback"].sum().item())
                 image = batch["image"].to(device, non_blocking=device.type == "cuda")
                 target = batch["mask"].to(device, non_blocking=device.type == "cuda")
                 band = batch["boundary"].to(device, non_blocking=device.type == "cuda")
@@ -2224,6 +2466,9 @@ def train_command(args):
                    "gradient_norm": float(np.mean(gradient_norms)) if gradient_norms else None,
                    "peak_cuda_gib": peak, "epoch_seconds": epoch_seconds,
                    "training_patches_per_second": args.steps_per_epoch * args.batch_size / epoch_seconds,
+                   "actual_foreground_patch_fraction": positive_patches / (args.steps_per_epoch * args.batch_size),
+                   "mean_patch_foreground_fraction": patch_foreground_sum / (args.steps_per_epoch * args.batch_size),
+                   "sampling_counts": dict(sampling_counts), "sampling_fallbacks": sampling_fallbacks,
                    "skipped_optimizer_updates": skipped_updates, "validation_dice": None,
                    "validation_hd95_mm_finite_only": None, "validation_surface_dice": None,
                    "validation_seconds": None, "validation_failures": None, "validation_complete_misses": None,
@@ -2243,6 +2488,7 @@ def train_command(args):
                 row["validation_seconds"] = time.perf_counter() - val_started
                 row["validation_failures"] = summary["technical_failures"]
                 row["validation_complete_misses"] = summary["complete_miss_cases"]
+                row["validation_zero_overlap_cases"] = summary.get("zero_overlap_cases")
                 for destination, metric in (("validation_dice", "dice"),
                     ("validation_hd95_mm_finite_only", "hd95_mm"), ("validation_surface_dice", "surface_dice")):
                     row[destination] = summary["metrics"].get(metric, {}).get("mean")
@@ -2266,6 +2512,11 @@ def train_command(args):
             atomic_checkpoint(run / "checkpoints" / "last.pt", checkpoint)
             write_csv(run / "history.csv", history)
             atomic_json(run / "history.json", history)
+            atomic_json(run / "sampling" / f"epoch_{epoch + 1:04d}.json", {
+                "counts": dict(sampling_counts), "fallbacks": sampling_fallbacks,
+                "actual_foreground_patch_fraction": row["actual_foreground_patch_fraction"],
+                "mean_patch_foreground_fraction": row["mean_patch_foreground_fraction"],
+                "scope": "training patches after augmentation, not full-volume performance"})
             LOGGER.info("Epoch %d complete: loss %.4f, validation Dice %s", epoch + 1, row["loss"], row["validation_dice"])
             if args.early_stopping_checks > 0 and stale_checks >= args.early_stopping_checks:
                 LOGGER.info("Early stop after %d non-improving validation checks.", stale_checks)
@@ -2283,7 +2534,30 @@ def train_command(args):
         atomic_json(run / "failure.json", {"time": now(), "reason": str(exc),
                                          "resume_policy": "last complete epoch; unfinished epoch replays"})
         raise
-    report_build(run, [run], args.figure_cases, args.dpi, args.vector, prepared_manifest=args.manifest)
+    report_inputs = [run]
+    if args.overfit_cases:
+        # Real training-case memorization audit, including original-grid and
+        # axial/coronal/sagittal overlays. Never substitute validation patients.
+        diagnostic_model, diagnostic_checkpoint = load_inference_model(run / "checkpoints" / "best.pt", device)
+        diagnostic_out = run / "diagnostic_evaluation"
+        if diagnostic_out.exists():
+            diagnostic_out = run / ("diagnostic_evaluation_" + uuid.uuid4().hex[:8])
+        diagnostic_out.mkdir(parents=True)
+        atomic_json(diagnostic_out / "protocol.json", {
+            **protocol, "partition": "train-diagnostic", "case_ids": [r["case_id"] for r in train_records],
+            "checkpoint_sha256": file_digest(run / "checkpoints" / "best.pt"),
+            "scope": "memorization of training patients, not generalization", "created": now()})
+        diagnostic_rows = evaluate_records(diagnostic_model, train_records, base, diagnostic_checkpoint["acquisition_stats"],
+            patch, args.overlap, args.threshold, args.surface_tolerance_mm, device, precision,
+            output=diagnostic_out, metadata_control=args.metadata_control, figure_cases=len(train_records))
+        if any(r["status"] != "success" for r in diagnostic_rows):
+            atomic_json(run / "diagnostic_failure.json", {"rows": diagnostic_rows, "output": str(diagnostic_out)})
+            raise UserError("Final training-case diagnostic export failed; inspect diagnostic_failure.json.")
+        report_build(diagnostic_out, [diagnostic_out], len(train_records), args.dpi, args.vector,
+                     prepared_manifest=args.manifest)
+        LOGGER.info("Training-case diagnostic overlays/report: %s", diagnostic_out / "report.html")
+        del diagnostic_model
+    report_build(run, report_inputs, args.figure_cases, args.dpi, args.vector, prepared_manifest=args.manifest)
     print(f"Training finished. Best checkpoint: {run / 'checkpoints' / 'best.pt'}")
     return 0
 
@@ -2367,11 +2641,14 @@ def qc_panels(hu, mask, path, spacing, title):
     return save_figure(fig, path)
 
 
-def save_case_panels(hu, reference, probability, threshold, spacing, out, case_id, dpi=300):
+def save_case_panels(hu, reference, probability, threshold, spacing, out, case_id, dpi=300,
+                     prediction_mask=None):
     plt = plotting()
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    pred = probability >= threshold
+    pred = np.asarray(prediction_mask, dtype=bool) if prediction_mask is not None else probability >= threshold
+    if pred.shape != hu.shape or probability.shape != hu.shape:
+        raise UserError("Qualitative CT, probability, and prediction grids disagree.")
     center = visual_center(reference, probability)
     index = center[0]
     fig, axes = plt.subplots(1, 4, figsize=(16, 5))
@@ -2531,17 +2808,50 @@ def compatible_comparisons(roots):
         evaluations.append((root, protocol, rows))
     if len(evaluations) < 2:
         return [], "Need two completed explicit evaluation outputs, not two labels for one run."
-    keys = ("manifest_fingerprint", "split_fingerprint", "partition", "target", "threshold",
-            "postprocessing", "surface_tolerance_mm", "surface_convention", "overlap")
+    keys = ("manifest_fingerprint", "split_fingerprint", "partition", "target",
+            "surface_tolerance_mm", "surface_convention", "overlap")
     baseline = evaluations[0]
     base_cases = {(r["case_id"], r["patient_id"]) for r in baseline[2]}
+    policies = []
     for root, protocol, rows in evaluations:
         if any(protocol.get(k) != baseline[1].get(k) for k in keys):
             return [], f"Incompatible evaluation protocol in {root.name}; no pooled comparison."
-        if {(r["case_id"], r["patient_id"]) for r in rows} != base_cases or any(r["status"] != "success" for r in rows):
+        identities = [(r["case_id"], r["patient_id"]) for r in rows]
+        if len(identities) != len(set(identities)):
+            return [], "Comparison contains duplicate case identities."
+        if set(identities) != base_cases or any(r["status"] != "success" for r in rows):
             return [], "Comparison patient/case sets differ or include technical failures."
-        if any(r.get("dice") is None for r in rows):
+        if "case_ids" in protocol and set(protocol["case_ids"]) != {r["case_id"] for r in rows}:
+            return [], "Comparison lacks one or more expected evaluation cases."
+        if any(r.get("dice") is None or not math.isfinite(float(r["dice"])) for r in rows):
             return [], "Comparison requires labeled case metrics."
+        source = protocol.get("threshold_source", "")
+        if source.startswith("frozen validation selection: "):
+            point_path = root / "operating_point.json"
+            if not point_path.exists():
+                return [], "Validation-frozen comparison requires the saved operating_point.json."
+            point = load_json(point_path)
+            fingerprint = stable_hash({k: v for k, v in point.items() if k != "fingerprint"})
+            if (point.get("fingerprint") != fingerprint or point.get("source_partition") != "val"
+                    or source != "frozen validation selection: " + fingerprint
+                    or any(point.get(k) != protocol.get(k) for k in
+                           ("checkpoint_sha256", "target", "manifest_fingerprint", "split_fingerprint", "threshold"))
+                    or postprocessing_recipe(point.get("postprocessing", "none")) !=
+                       postprocessing_recipe(protocol.get("postprocessing", "none"))):
+                return [], "Comparison operating point is not a compatible frozen validation selection."
+            policies.append("validation-frozen")
+        elif source == "prespecified before training, not test-tuned":
+            policies.append("common-prespecified")
+        else:
+            return [], "Comparison requires a documented prespecified or validation-frozen operating policy."
+    if len(set(policies)) != 1:
+        return [], "Do not mix prespecified and validation-selected operating policies in one paired comparison."
+    if policies[0] == "common-prespecified":
+        for _, protocol, _ in evaluations[1:]:
+            if (protocol.get("threshold") != baseline[1].get("threshold") or
+                    postprocessing_recipe(protocol.get("postprocessing", "none")) !=
+                    postprocessing_recipe(baseline[1].get("postprocessing", "none"))):
+                return [], "Prespecified comparisons require a common threshold and postprocessing recipe."
     return evaluations, ""
 
 
@@ -2810,8 +3120,11 @@ def report_build(output, roots, case_limit=6, dpi=300, vector="none", prepared_m
         def subgroups():
             fig, axes = plt.subplots(1, 2, figsize=(12, 5))
             missed = sum(r["complete_miss"] for r in success)
-            axes[0].bar(["Complete misses", "Other successful cases", "Technical failures"],
-                        [missed, len(success) - missed, len(metrics) - len(success)])
+            disjoint = sum(int(r.get("disjoint_nonempty_prediction",
+                r.get("reference_volume_ml", 0) > 0 and r.get("predicted_volume_ml", 0) > 0 and r.get("dice") == 0))
+                for r in success)
+            axes[0].bar(["Empty target misses", "Nonempty zero-overlap", "Other evaluated cases", "Technical failures"],
+                        [missed, disjoint, len(success) - missed - disjoint, len(metrics) - len(success)])
             axes[0].tick_params(axis="x", rotation=20)
             axes[0].set(ylabel="Cases", title="Failure and target-miss accounting")
             edges, labels = (0, 5, 20, math.inf), ("0–5", "5–20", "20+")
@@ -2869,7 +3182,12 @@ def report_build(output, roots, case_limit=6, dpi=300, vector="none", prepared_m
             ci = np.quantile([rng.choice(differences, len(differences), replace=True).mean() for _ in range(1000)], [.025, .975])
             paired_effects.append({"reference": comparisons[0][0].name, "comparison": root.name,
                                    "n_patients": len(patients), "mean_dice_difference": float(differences.mean()),
-                                   "ci95": ci.tolist(), "differences": differences.tolist()})
+                                   "ci95": ci.tolist(), "differences": differences.tolist(),
+                                   "operating_policy": "individually validation-frozen" if p.get("threshold_source", "").startswith("frozen validation selection: ") else "common prespecified",
+                                   "reference_threshold": comparisons[0][1]["threshold"],
+                                   "comparison_threshold": p["threshold"],
+                                   "reference_postprocessing": comparisons[0][1].get("postprocessing", "none"),
+                                   "comparison_postprocessing": p.get("postprocessing", "none")})
         atomic_json(output / "paired_comparisons.json", paired_effects)
         def effects_plot():
             fig, ax = plt.subplots(figsize=(9, 5))
@@ -2923,8 +3241,13 @@ def report_build(output, roots, case_limit=6, dpi=300, vector="none", prepared_m
                 try:
                     image = sitk.ReadImage(str(probability_path), sitk.sitkFloat32)
                     working = sitk.Resample(image, empty_grid(meta["working_grid"]), sitk.Transform(), sitk.sitkLinear, 0.)
+                    native_pred = postprocess_prediction(sitk.GetArrayFromImage(image) >= protocol["threshold"],
+                                                        meta["native_spacing_zyx_mm"], protocol.get("postprocessing", "none"))
+                    pred_image = image_on_grid(native_pred.astype(np.uint8), meta["native_grid"])
+                    working_pred = sitk.GetArrayFromImage(sitk.Resample(pred_image, empty_grid(meta["working_grid"]),
+                        sitk.Transform(), sitk.sitkNearestNeighbor, 0., sitk.sitkUInt8)).astype(bool)
                     save_case_panels(hu, ref, sitk.GetArrayFromImage(working), protocol["threshold"],
-                                     meta["target_spacing_zyx_mm"], folder, cid, dpi)
+                                     meta["target_spacing_zyx_mm"], folder, cid, dpi, prediction_mask=working_pred)
                     ranked_paths.append(folder / "segmentation.png")
                 finally:
                     hu._mmap.close()
@@ -2932,10 +3255,11 @@ def report_build(output, roots, case_limit=6, dpi=300, vector="none", prepared_m
             except (UserError, OSError, RuntimeError, ValueError) as exc:
                 LOGGER.warning("Ranked-case figure unavailable for %s: %s", cid, exc)
         existing(36, ranked_paths, "Deterministic worst / median / best by recorded complete-volume Dice; ties by case ID.")
-        miss_paths = [primary / "cases" / r["case_id"] / "errors.png" for r in ranked if r.get("complete_miss")]
-        existing(38, miss_paths[:case_limit], "Complete-target misses. No unannotated interface-difficulty labels are inferred.")
+        miss_paths = [primary / "cases" / r["case_id"] / "errors.png" for r in ranked
+                      if r.get("zero_overlap", r.get("reference_volume_ml", 0) > 0 and r.get("dice") == 0)]
+        existing(38, miss_paths[:case_limit], "Zero-overlap target failures, including nonempty disjoint predictions and empty target misses.")
         if not miss_paths:
-            skip(38, "No recorded complete misses with available panels; difficult-interface labels were not supplied.")
+            skip(38, "No zero-overlap failures with available panels; difficult-interface labels were not supplied.")
         if include_surfaces:
             for cid in selected[:1]:
                 folder = primary / "cases" / cid
@@ -3045,9 +3369,24 @@ def report_build(output, roots, case_limit=6, dpi=300, vector="none", prepared_m
     if samples is not None:
         p, y, weights, case_scores = samples
         bins, brier, ece = calibration_values(p, y, weights)
+        probability_quantiles = {name: np.quantile(p[selected], [0., .25, .5, .75, .9, .99, 1.]).tolist()
+            if selected.any() else None for name, selected in (("reference_positive", y), ("reference_negative", ~y))}
+        threshold_diagnostics = []
+        for threshold in sorted(set((.5, .9, .95, .98, .99, float(protocol.get("threshold", .5))))):
+            selected = p >= threshold
+            tp, fp, fn = float(weights[selected & y].sum()), float(weights[selected & ~y].sum()), float(weights[~selected & y].sum())
+            threshold_diagnostics.append({"threshold": threshold, "weighted_precision": tp / (tp + fp) if tp + fp else 0.,
+                "weighted_recall": tp / (tp + fn) if tp + fn else None,
+                "sampled_predicted_positive_voxels": int(selected.sum())})
         atomic_json(output / "calibration.json", {"brier": brier, "ece_10_equal_width_bins": ece, "bins": bins,
             "sampled_voxels": len(p), "sampling": "uniform within case; deterministic bounded subsampling",
             "weighting": "native voxel count / retained sampled count per case",
+            "sampled_reference_positive_voxels": int(y.sum()),
+            "estimated_population_foreground_prevalence": float(np.average(y, weights=weights)),
+            "probability_quantile_levels": [0., .25, .5, .75, .9, .99, 1.],
+            "unweighted_sample_probability_quantiles_by_class": probability_quantiles,
+            "threshold_diagnostics": threshold_diagnostics,
+            "threshold_diagnostic_scope": "Descriptive sampled raw probabilities; no component filtering or threshold selection; not patient-level full-volume metrics.",
             "interpretation": "voxel-pooled descriptive analysis dominated by background; not patient diagnosis"})
         def calibration_plot():
             fig, ax = plt.subplots(figsize=(7, 6))
@@ -3090,7 +3429,9 @@ def report_build(output, roots, case_limit=6, dpi=300, vector="none", prepared_m
     write_csv(output / "figure_manifest.csv", statuses)
     summary_rows = [{"case_id": r.get("case_id"), "patient_id": r.get("patient_id"), "status": r.get("status"),
                      "Dice": r.get("dice"), "HD95_mm": r.get("hd95_mm"), "surface_status": r.get("surface_status"),
-                     "complete_miss": r.get("complete_miss"), "reason": r.get("reason", "")} for r in metrics]
+                     "complete_miss": r.get("complete_miss"), "empty_prediction": r.get("empty_prediction"),
+                     "zero_overlap": r.get("zero_overlap", int(r.get("reference_volume_ml", 0) > 0 and r.get("dice") == 0)),
+                     "reason": r.get("reason", "")} for r in metrics]
     def table(rows):
         if not rows:
             return "<p>No patient metrics recorded. Run evaluate after training.</p>"
@@ -3166,10 +3507,23 @@ def select_threshold_command(args):
     grid = sorted(set(args.thresholds))
     if not grid or any(not 0 < x < 1 for x in grid):
         raise UserError("All candidate thresholds must be strictly between zero and one.")
+    modes = sorted(set(getattr(args, "postprocess_modes", ("none",))),
+                   key=lambda mode: ("none", "largest", "min-volume").index(mode))
+    minimums = sorted(set(getattr(args, "min_volumes_ml", (.1, 1.))))
+    if not modes:
+        raise UserError("At least one postprocessing mode is required.")
+    if "min-volume" in modes and (not minimums or any(not math.isfinite(v) or v <= 0 for v in minimums)):
+        raise UserError("Candidate component volumes must be positive and finite in mL.")
+    recipes = [postprocessing_recipe(mode, volume) for mode in modes
+               for volume in (minimums if mode == "min-volume" else (0.,))]
     by_id = {r["case_id"]: r for r in manifest["records"]}
-    scores = {threshold: {} for threshold in grid}
+    candidates = [{"threshold": threshold, "postprocessing": recipe, "patients": {},
+                   "empty_prediction_cases": 0, "zero_overlap_cases": 0}
+                  for threshold in grid for recipe in recipes]
     for row in rows:
         cid = row["case_id"]
+        if cid not in by_id or row["patient_id"] != by_id[cid]["patient_id"]:
+            raise UserError("Validation result case/patient identity differs from the manifest.")
         directory, metadata = cache_path(base, by_id[cid])
         reference = np.load(directory / "native_mask.npy", mmap_mode="r", allow_pickle=False)
         try:
@@ -3182,25 +3536,45 @@ def select_threshold_command(args):
             probability = sitk.GetArrayFromImage(probability_image)
             if not np.isfinite(probability).all() or np.any((probability < 0) | (probability > 1)):
                 raise UserError(f"Validation probability must be finite and in [0,1]: {cid}")
-            for threshold in grid:
-                pred = probability >= threshold
-                count = int(pred.sum()) + int(reference.sum())
-                dice = 2 * np.count_nonzero(pred & (reference > 0)) / count if count else 1.
-                scores[threshold].setdefault(row["patient_id"], []).append(float(dice))
+            if probability.shape != reference.shape:
+                raise UserError(f"Validation reference and probability shapes differ: {cid}")
+            spacing = metadata.get("native_spacing_zyx_mm", metadata["native_grid"]["spacing_xyz_mm"][::-1])
+            reference_bool = np.asarray(reference, dtype=bool)
+            r = int(reference_bool.sum())
+            # One native case and one candidate mask at a time. No cohort-sized
+            # stack of probabilities or candidate masks is retained.
+            for candidate in candidates:
+                pred = postprocess_prediction(probability >= candidate["threshold"], spacing,
+                                              candidate["postprocessing"])
+                p, tp = int(pred.sum()), int(np.count_nonzero(pred & reference_bool))
+                dice = 2 * tp / (p + r) if p + r else 1.
+                candidate["patients"].setdefault(row["patient_id"], []).append(float(dice))
+                candidate["empty_prediction_cases"] += int(p == 0)
+                candidate["zero_overlap_cases"] += int(r > 0 and tp == 0)
         finally:
             reference._mmap.close()
-    means = {threshold: float(np.mean([np.mean(v) for v in patients.values()]))
-             for threshold, patients in scores.items()}
-    # Deterministic tie break: closest to 0.5, then lowest numerical threshold.
-    chosen = min(grid, key=lambda t: (-means[t], abs(t - .5), t))
-    result = {"version": 1, "threshold": chosen, "source_partition": "val",
+    for candidate in candidates:
+        candidate["mean_dice"] = float(np.mean([np.mean(v) for v in candidate.pop("patients").values()]))
+    # Prefer the simpler recipe on exact score ties, then threshold closest to 0.5.
+    chosen = min(candidates, key=lambda c: (-c["mean_dice"],
+                 ("none", "largest", "min-volume").index(c["postprocessing"]["mode"]),
+                 abs(c["threshold"] - .5), c["threshold"], c["postprocessing"]["min_volume_ml"]))
+    means = {c["threshold"]: c["mean_dice"] for c in candidates
+             if c["postprocessing"] == chosen["postprocessing"]}
+    result = {"version": 2, "threshold": chosen["threshold"], "source_partition": "val",
               "criterion": "mean within-patient averaged native-volume Dice", "scores": means,
+              "candidates": candidates, "selected_validation_dice": chosen["mean_dice"],
+              "development_score_warning": "Threshold and component recipe were selected on these validation cases; this is not an independent performance estimate or a retraining gain.",
               "checkpoint_sha256": protocol["checkpoint_sha256"], "target": protocol["target"],
               "manifest_fingerprint": manifest["fingerprint"], "split_fingerprint": protocol["split_fingerprint"],
-              "postprocessing": "none", "created": now(), "case_ids": sorted(row["case_id"] for row in rows)}
+              "postprocessing": chosen["postprocessing"], "created": now(),
+              "case_ids": sorted(row["case_id"] for row in rows)}
+    if "overlap" in protocol:
+        result["overlap"] = protocol["overlap"]
     result["fingerprint"] = stable_hash(result)
     atomic_json(Path(args.output), result)
-    print(f"Frozen validation-selected threshold {chosen:g}: {args.output}")
+    print(f"Frozen validation-selected threshold {chosen['threshold']:g}, "
+          f"postprocessing {chosen['postprocessing']}: {args.output}")
 
 
 ABLATIONS = ("baseline", "multiscale", "transformer", "fusion", "wavelet", "decoder", "acquisition",
@@ -3685,6 +4059,62 @@ def dicom_self_test(temp):
 
 
 # 12. Complete command-line interface and Windows-safe entry point ------------
+def mine_negatives_command(args):
+    """Mine only TRAIN working-grid false positives; never read validation/test labels."""
+    require_torch()
+    if not 0 < args.threshold < 1 or args.centres_per_case < 1 or args.max_cases < 0:
+        raise UserError("Mining needs threshold in (0,1), positive centre budget, nonnegative max-cases.")
+    output = Path(args.output).resolve()
+    if output.exists():
+        raise UserError("Hard-negative index already exists; choose a new output.")
+    manifest, base = load_manifest(args.manifest)
+    split = validate_split(manifest, load_json(args.splits))
+    device = select_device(args.device)
+    model, saved = load_inference_model(args.checkpoint, device)
+    if (saved["manifest_fingerprint"] != manifest["fingerprint"]
+            or saved["split_fingerprint"] != split["fingerprint"] or saved.get("overfit_cases")):
+        raise UserError("Mining requires a non-diagnostic checkpoint trained on this manifest/split.")
+    records = choose_records(manifest, split, "train")
+    if args.max_cases:
+        records = records[:args.max_cases]
+    precision = resolve_precision(device, args.precision)
+    result = {"version": 1, "created": now(), "source_partition": "train", "coordinate_grid": "working_zyx",
+              "manifest_fingerprint": manifest["fingerprint"], "split_fingerprint": split["fingerprint"],
+              "prediction_checkpoint_sha256": file_digest(args.checkpoint), "threshold": args.threshold,
+              "selection": "bounded per-8-slice uniform false-positive candidates then global subsampling",
+              "cases": {}}
+    for record in records:
+        directory, metadata = cache_path(base, record)
+        hu = np.load(directory / "hu.npy", mmap_mode="r", allow_pickle=False)
+        reference = np.load(directory / "mask.npy", mmap_mode="r", allow_pickle=False)
+        try:
+            probability, _ = predict_working_volume(model, hu, metadata, saved["acquisition_stats"], saved["patch"],
+                args.overlap, device, precision, saved["metadata_control"])
+            rng = np.random.default_rng(int(stable_hash(record["case_id"])[:8], 16) + args.seed)
+            centres, false_positive_voxels = [], 0
+            for z in range(0, len(probability), 8):
+                slab = probability[z:z+8]
+                candidates = np.flatnonzero((slab >= args.threshold) & (reference[z:z+8] == 0))
+                false_positive_voxels += len(candidates)
+                if len(candidates):
+                    selected = rng.choice(candidates, min(args.centres_per_case, len(candidates)), replace=False)
+                    coords = np.column_stack(np.unravel_index(selected, slab.shape))
+                    coords[:, 0] += z
+                    centres.extend(coords.tolist())
+            if len(centres) > args.centres_per_case:
+                centres = [centres[i] for i in rng.choice(len(centres), args.centres_per_case, replace=False)]
+            result["cases"][record["case_id"]] = {"shape_zyx": list(probability.shape), "centres_zyx": centres,
+                                                    "false_positive_voxels": false_positive_voxels}
+        finally:
+            hu._mmap.close()
+            reference._mmap.close()
+        del probability, slab, candidates
+        LOGGER.info("Mined train case %d/%d (%d centres)", len(result["cases"]), len(records), len(centres))
+    result["fingerprint"] = stable_hash(result)
+    atomic_json(output, result)
+    print(f"Training-only hard-negative index: {output}")
+
+
 def add_figure_arguments(parser):
     parser.add_argument("--figure-cases", type=int, default=6, help="Bound selected qualitative/feature cases; 0 disables captures.")
     parser.add_argument("--dpi", type=int, default=300)
@@ -3702,6 +4132,7 @@ def add_train_arguments(parser):
     parser.add_argument("--device", default="auto", help="auto, cuda:0, or explicit cpu debugging.")
     parser.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto")
     parser.add_argument("--preflight", action="store_true", help="Probe forward/backward/AdamW allocation before training; always on for auto preset.")
+    parser.add_argument("--preflight-only", action="store_true", help="Run a real-training-patch allocation probe and stop; uses a NEW --run.")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--isotropic-early", action="store_true", help="Use 3x3x3 early kernels instead of 1x3x3; strides unchanged.")
     for name in ("multiscale", "transformer", "adaptive-fusion", "wavelet", "decoder-conditioning",
@@ -3721,6 +4152,10 @@ def add_train_arguments(parser):
     parser.add_argument("--warmup-epochs", type=int, default=5)
     parser.add_argument("--clip-grad", type=float, default=12.)
     parser.add_argument("--foreground-probability", type=float, default=.5)
+    parser.add_argument("--anatomical-background-probability", type=float, default=0.,
+                        help="Training tumour-free patches centred on lung-like HU; remainder is uniform sampling.")
+    parser.add_argument("--hard-negative-probability", type=float, default=0.)
+    parser.add_argument("--hard-negative-index", help="Fingerprint-checked train-only working-grid centres from mine-negatives.")
     parser.add_argument("--lambda-ds", type=float, default=1.)
     parser.add_argument("--lambda-boundary", type=float, default=.1)
     parser.add_argument("--no-augmentation", action="store_true")
@@ -3775,6 +4210,19 @@ def build_parser():
     train = commands.add_parser("train", help="Train exactly one explicit model configuration.")
     add_train_arguments(train)
     train.set_defaults(handler=train_command)
+    mining = commands.add_parser("mine-negatives", help="Mine bounded false-positive centres from TRAINING predictions only.")
+    mining.add_argument("--manifest", required=True)
+    mining.add_argument("--splits", required=True)
+    mining.add_argument("--checkpoint", required=True)
+    mining.add_argument("--output", required=True)
+    mining.add_argument("--device", default="auto")
+    mining.add_argument("--precision", choices=("auto", "fp32", "fp16", "bf16"), default="auto")
+    mining.add_argument("--threshold", type=float, default=.9)
+    mining.add_argument("--overlap", type=float, default=.5)
+    mining.add_argument("--centres-per-case", type=int, default=256)
+    mining.add_argument("--max-cases", type=int, default=0, help="0 means all training cases.")
+    mining.add_argument("--seed", type=int, default=42)
+    mining.set_defaults(handler=mine_negatives_command)
     for command in ("evaluate", "predict"):
         inference = commands.add_parser(command, help="Complete-volume " + command + " with original-grid outputs.")
         inference.add_argument("--manifest", required=True)
@@ -3806,6 +4254,10 @@ def build_parser():
     threshold.add_argument("--splits", help="Verify validation coverage; required for legacy evaluations without case_ids.")
     threshold.add_argument("--output", required=True)
     threshold.add_argument("--thresholds", nargs="+", type=float, default=(.2, .3, .4, .5, .6, .7, .8))
+    threshold.add_argument("--postprocess-modes", nargs="+", choices=("none", "largest", "min-volume"),
+                           default=("none",), help="Validation-only component recipes to compare jointly with thresholds.")
+    threshold.add_argument("--min-volumes-ml", nargs="+", type=float, default=(.1, 1.),
+                           help="Physical component cutoffs for min-volume mode; ignored for other modes.")
     threshold.set_defaults(handler=select_threshold_command)
     ablate = commands.add_parser("ablate", help="Run only an explicitly selected sequence of implemented configurations.")
     add_train_arguments(ablate)
