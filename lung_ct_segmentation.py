@@ -65,6 +65,7 @@ BANDS = ("LLL", "LLH", "LHL", "LHH", "HLL", "HLH", "HHL", "HHH")
 LOGGER = logging.getLogger("lung_ct")
 PRESETS = {
     "compact": {"patch": (32, 96, 96), "widths": (16, 32, 64, 128, 192)},
+    "medium": {"patch": (48, 128, 128), "widths": (16, 32, 64, 128, 192)},
     "balanced": {"patch": (48, 128, 128), "widths": (16, 32, 64, 128, 192)},
     "reference": {"patch": (64, 192, 192), "widths": (24, 48, 96, 192, 256)},
 }
@@ -1566,30 +1567,61 @@ class SegmentationModel(Module):
         return result
 
 
-def segmentation_loss(logits, target):
-    """Per-example foreground soft Dice + mean BCE, then batch mean, FP32 reductions.
+def focal_tversky_loss(logits, target, alpha=0.7, beta=0.3, gamma=4/3, eps=1e-5):
+    """Focal Tversky Loss for 3D binary segmentation with extreme class imbalance.
 
-    Epsilon makes an exactly empty target/prediction well-defined. Sigmoid exists
-    only on the Dice branch; BCE consumes raw logits for numerical stability.
+    TI = (TP + eps) / (TP + alpha * FP + beta * FN + eps)
+    FocalTverskyLoss = (1 - TI) ** gamma
     """
     logits, target = logits.float(), target.float()
     if logits.shape != target.shape:
         raise UserError(f"Loss grids disagree: {logits.shape} versus {target.shape}")
     probability = logits.sigmoid()
     axes = (1, 2, 3, 4)
-    dice = 1 - (2 * (probability * target).sum(axes) + 1e-5) / (
-        probability.sum(axes) + target.sum(axes) + 1e-5)
+    tp = (probability * target).sum(axes)
+    fp = (probability * (1.0 - target)).sum(axes)
+    fn = ((1.0 - probability) * target).sum(axes)
+    ti = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
+    ti = torch.clamp(ti, 0.0, 1.0)
+    loss = torch.pow(1.0 - ti, gamma)
+    return loss.mean()
+
+
+def segmentation_loss(logits, target, loss_type="dice_bce", alpha=0.7, beta=0.3, gamma=4/3):
+    """Per-example foreground loss supporting dice_bce, focal_tversky, and dice_focal_tversky."""
+    logits, target = logits.float(), target.float()
+    if logits.shape != target.shape:
+        raise UserError(f"Loss grids disagree: {logits.shape} versus {target.shape}")
+    probability = logits.sigmoid()
+    axes = (1, 2, 3, 4)
+    eps = 1e-5
+    dice = 1 - (2 * (probability * target).sum(axes) + eps) / (
+        probability.sum(axes) + target.sum(axes) + eps)
     bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none").mean(axes)
-    return (dice + bce).mean(), dice.mean(), bce.mean()
+
+    tp = (probability * target).sum(axes)
+    fp = (probability * (1.0 - target)).sum(axes)
+    fn = ((1.0 - probability) * target).sum(axes)
+    ti = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
+    ti = torch.clamp(ti, 0.0, 1.0)
+    ft = torch.pow(1.0 - ti, gamma)
+
+    if loss_type == "focal_tversky":
+        main = ft.mean()
+    elif loss_type == "dice_focal_tversky":
+        main = (dice + ft).mean()
+    else:
+        main = (dice + bce).mean()
+    return main, dice.mean(), bce.mean()
 
 
-def total_loss(output, target, band, lambda_ds=1., lambda_boundary=.1):
-    main, dice, bce = segmentation_loss(output["logits"], target)
+def total_loss(output, target, band, lambda_ds=1., lambda_boundary=.1, loss_type="dice_bce", alpha=0.7, beta=0.3, gamma=4/3):
+    main, dice, bce = segmentation_loss(output["logits"], target, loss_type=loss_type, alpha=alpha, beta=beta, gamma=gamma)
     zero = main.new_zeros(())
     aux1 = aux2 = boundary = zero
     if "aux1" in output:
-        aux1 = segmentation_loss(F.interpolate(output["aux1"], size=target.shape[2:], mode="trilinear", align_corners=False), target)[0]
-        aux2 = segmentation_loss(F.interpolate(output["aux2"], size=target.shape[2:], mode="trilinear", align_corners=False), target)[0]
+        aux1 = segmentation_loss(F.interpolate(output["aux1"], size=target.shape[2:], mode="trilinear", align_corners=False), target, loss_type=loss_type, alpha=alpha, beta=beta, gamma=gamma)[0]
+        aux2 = segmentation_loss(F.interpolate(output["aux2"], size=target.shape[2:], mode="trilinear", align_corners=False), target, loss_type=loss_type, alpha=alpha, beta=beta, gamma=gamma)[0]
     if "boundary_logits" in output:
         boundary = F.binary_cross_entropy_with_logits(output["boundary_logits"].float(), band.float())
     loss = main + lambda_ds * (.5 * aux1 + .25 * aux2) + lambda_boundary * boundary
@@ -2115,7 +2147,7 @@ def model_config_from_args(args, preset):
 
 
 def preflight_model(config, patch, batch_size, device, precision, lambda_ds, lambda_boundary,
-                    real_batch=None):
+                    real_batch=None, loss_type="dice_bce", alpha=0.7, beta=0.3, gamma=4/3):
     """Two full backward/AdamW steps, with real training patches when available."""
     started = time.perf_counter()
     if device.type == "cuda":
@@ -2138,7 +2170,8 @@ def preflight_model(config, patch, batch_size, device, precision, lambda_ds, lam
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, precision):
                 output = model(image, q, True)
-                loss, _ = total_loss(output, target, band, lambda_ds, lambda_boundary)
+                loss, _ = total_loss(output, target, band, lambda_ds, lambda_boundary,
+                                     loss_type=loss_type, alpha=alpha, beta=beta, gamma=gamma)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 12.)
@@ -2433,7 +2466,11 @@ def train_command(args):
                 group_size = min(args.accumulation, len(loader) - group_start)
                 with autocast_context(device, precision):
                     output = model(image, q, True)
-                    loss, parts = total_loss(output, target, band, args.lambda_ds, args.lambda_boundary)
+                    loss, parts = total_loss(output, target, band, args.lambda_ds, args.lambda_boundary,
+                                             loss_type=getattr(args, "loss", "dice_bce"),
+                                             alpha=getattr(args, "loss_alpha", 0.7),
+                                             beta=getattr(args, "loss_beta", 0.3),
+                                             gamma=getattr(args, "loss_gamma", 4/3))
                 scaler.scale(loss / group_size).backward()
                 for key, value in parts.items():
                     sums[key] += value
@@ -4158,6 +4195,11 @@ def add_train_arguments(parser):
     parser.add_argument("--hard-negative-index", help="Fingerprint-checked train-only working-grid centres from mine-negatives.")
     parser.add_argument("--lambda-ds", type=float, default=1.)
     parser.add_argument("--lambda-boundary", type=float, default=.1)
+    parser.add_argument("--loss", choices=("dice_bce", "focal_tversky", "dice_focal_tversky"), default="dice_bce",
+                        help="Loss function: default foreground soft Dice + BCE, focal_tversky, or combined.")
+    parser.add_argument("--loss-alpha", type=float, default=0.7, help="Focal Tversky false-positive penalty parameter.")
+    parser.add_argument("--loss-beta", type=float, default=0.3, help="Focal Tversky false-negative penalty parameter.")
+    parser.add_argument("--loss-gamma", type=float, default=1.3333333333333333, help="Focal Tversky exponent gamma.")
     parser.add_argument("--no-augmentation", action="store_true")
     parser.add_argument("--val-every", type=int, default=5)
     parser.add_argument("--early-stopping-checks", type=int, default=0, help="0 disables; count validation checks, not epochs.")

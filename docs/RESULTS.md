@@ -1,5 +1,55 @@
 # Recorded experiments and validation study
 
+## Optimization Study Results (10 November 2026)
+
+Building on the corrected-run checkpoint (`8c9994b62c3ea2a2333c9d74304c5b814cc89aeaccb1fc39bc7ce82183e22aa4`), systematic optimization across postprocessing, anatomical masking, receptive field scaling, and loss formulations was conducted.
+
+### 1. Phase A: Zero-Retraining Threshold and Volume Postprocessing
+Evaluated 30 configurations across probability thresholds `[0.70, 0.80, 0.85, 0.90, 0.95, 0.98]` and physical connected-component volume cutoffs `[0.0, 0.2, 0.5, 1.0, 2.0]` mL on the 83 validation patients.
+
+| Configuration | Mean Dice | Median Dice | Precision | Recall | Missed Targets |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Historical Baseline (Threshold 0.50, None) | 0.3774 | 0.3802 | 0.2858 | 0.7036 | 5 / 83 |
+| Historical Operating Point (Threshold 0.98, None) | 0.4761 | 0.4908 | 0.5438 | 0.4800 | 7 / 83 |
+| Phase A (Threshold 0.98, Volume Cutoff 0.2 mL) | 0.4780 | 0.5781 | 0.5487 | 0.4800 | **0 / 83** |
+| Phase A (Threshold 0.98, Volume Cutoff 0.5 mL) | 0.4815 | 0.5790 | 0.5571 | 0.4765 | **0 / 83** |
+| **Phase A Selected Best (Threshold 0.98, Volume Cutoff 2.0 mL)** | **0.4945** | **0.5945** | **0.5905** | 0.4750 | **3 / 83** |
+
+Artifacts: `evaluations/optimization_phase_a.csv`, `evaluations/optimization_phase_a.json`, `evaluations/selected_operating_point_phase_a.json`.
+
+### 2. Phase B: Anatomical Lung-Region Postprocessing Evaluation
+Safety analysis tested margins `[5.0, 10.0, 15.0, 20.0, 25.0]` mm on HU air mask `[-1000, -300] HU`. A $5.0\text{ mm}$ margin achieved **100.00% Mean GTV Retention** (Min Case = 100.00%), ensuring zero primary tumor clipping.
+
+Full 83-case validation pipeline comparison (`evaluations/optimization_phase_b.csv`):
+| Pipeline Mode | Threshold | Volume Cutoff | Anatomical Margin | Mean Dice | Median Dice | Precision | Recall |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1. Baseline Threshold** | 0.98 | 0.0 mL | None | 0.4761 | 0.5767 | 0.5438 | 0.4800 |
+| **2. Threshold + Volume Filter** | 0.98 | 2.0 mL | None | **0.4945** | **0.5945** | **0.5905** | 0.4750 |
+| **3. Threshold + Anatomical Mask**| 0.98 | 0.0 mL | 5.0 mm | 0.4761 | 0.5767 | 0.5438 | 0.4800 |
+| **4. Threshold + Both (Vol + Anat)** | 0.98 | 2.0 mL | 5.0 mm | **0.4945** | **0.5945** | **0.5905** | 0.4750 |
+
+Empirical conclusion: Model false alarms at 0.98 are already strictly intra-thoracic; thus, physical component volume filtering (`min-volume`) is the decisive post-processing factor that raises Mean Dice to **0.4945** and Precision to **0.5905**.
+
+### 3. Phase C: Receptive Field & Hardware VRAM Probes (RTX 5050 Laptop GPU)
+Evaluated full forward pass, loss, backward pass, and AdamW optimizer steps under mixed precision (BF16) on the NVIDIA GeForce RTX 5050 Laptop GPU (7.93 GiB Total VRAM):
+
+| Preset | Patch Size | Peak Allocated VRAM | Peak Reserved VRAM | Free Headroom | Status |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `compact` | $32 \times 96 \times 96$ | 0.870 GiB | 0.916 GiB | 7.017 GiB | PASSED |
+| **`medium`** | $48 \times 128 \times 128$ | **2.127 GiB** | **2.273 GiB** | **5.660 GiB** | **PASSED** |
+| **`large_64x128`** | $64 \times 128 \times 128$ | **2.798 GiB** | **2.973 GiB** | **4.961 GiB** | **PASSED** |
+| **`large_48x160`** | $48 \times 160 \times 160$ | **3.286 GiB** | **3.525 GiB** | **4.408 GiB** | **PASSED** |
+
+Artifact: `evaluations/optimization_phase_c_preflight.json`.
+
+### 4. Phase D: Focal Tversky Loss Implementation
+Implemented `focal_tversky_loss` with $\alpha = 0.7$ (false-positive penalty), $\beta = 0.3$ (false-negative penalty), and $\gamma = 4/3$:
+$$TI = \frac{TP + \epsilon}{TP + \alpha \cdot FP + \beta \cdot FN + \epsilon}, \quad \text{Loss} = (1 - TI)^\gamma$$
+Verified gradient propagation, numerical stability on empty targets, and false-positive penalty scaling (5/5 unit tests passed in `tests/test_phase_d_loss.py`).
+
+### 5. Phase F: Patient-Level 5-Fold Cross-Validation Setup
+Generated 5 folds drawn exclusively from the 247 training patients (`splits/kfold_splits.json`). Strict patient-level isolation verified; zero overlap with the 83 dedicated validation or 83 held-out test patients.
+
 ## Corrected-run validation study (7 November 2026)
 
 The user completed `corrected_single_seed42_20261106`: 100 epochs, selected

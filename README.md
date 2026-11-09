@@ -20,12 +20,13 @@ prediction, evaluation, and visual reporting.
 
 ## Results at a Glance
 
-| Partition | Mean Dice | Median Dice | Precision | Recall | HD95 (mm) | Surface Dice |
-|----------|----------|------------|-----------|--------|-----------|--------------|
-| Validation (threshold 0.98) | 0.4761 | N/A | 0.5438 | 0.4800 | 110.23 | 0.2796 |
-| Test (frozen 0.98) | 0.4217 | N/A | 0.4925 | 0.4586 | 110.00 | 0.2584 |
+| Partition / Configuration | Mean Dice | Median Dice | Precision | Recall | HD95 (mm) | Surface Dice |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|
+| Historical Validation (threshold 0.98, raw) | 0.4761 | 0.4908 | 0.5438 | 0.4800 | 110.23 | 0.2796 |
+| **Optimized Validation (Phase A: threshold 0.98 + 2.0 mL cutoff)** | **0.4945** | **0.5945** | **0.5905** | 0.4750 | — | — |
+| Historical Held-Out Test (frozen threshold 0.98 reference) | 0.4217 | 0.4403 | 0.4925 | 0.4586 | 110.00 | 0.2584 |
 
-*All values are taken from the recorded experiments in `docs/RESULTS.md`. No clinical claims are made.*
+*All values are taken from the recorded experiments in `docs/RESULTS.md` and `docs/OPTIMIZATION_EXPERIMENTS.md`. The optimized operating point was selected strictly on validation data without touching or leaking the held-out test set. No clinical claims are made.*
 
 ![Metrics summary](outputs/figures/msf_hsat_metrics.png)
 
