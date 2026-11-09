@@ -18,6 +18,17 @@ prediction, evaluation, and visual reporting.
 [Setup](#installation) · [Workflow](#training-and-evaluation-workflow) ·
 [Documentation](#project-structure-and-documentation)
 
+## Results at a Glance
+
+| Partition | Mean Dice | Median Dice | Precision | Recall | HD95 (mm) | Surface Dice |
+|----------|----------|------------|-----------|--------|-----------|--------------|
+| Validation (threshold 0.98) | 0.4761 | N/A | 0.5438 | 0.4800 | 110.23 | 0.2796 |
+| Test (frozen 0.98) | 0.4217 | N/A | 0.4925 | 0.4586 | 110.00 | 0.2584 |
+
+*All values are taken from the recorded experiments in `docs/RESULTS.md`. No clinical claims are made.*
+
+![Metrics summary](outputs/figures/msf_hsat_metrics.png)
+
 ## Project overview
 
 A CT scan is a stack of slices forming a 3D image. A segmentation mask marks which
@@ -286,6 +297,19 @@ The saved operating point binds the selection to its checkpoint and data/split
 provenance. **Never select thresholds, postprocessing, or model settings on the
 test set.** For a planned final test assessment, pass the frozen file through
 `evaluate --operating-point`; see the [evaluation protocol](docs/EVALUATION.md).
+
+## Baseline results (U‑Net)
+
+| Metric | Value |
+|--------|-------|
+| Mean Dice (val) | TBD |
+| Mean Dice (test) | TBD |
+| Precision (val) | TBD |
+| Recall (val) | TBD |
+| HD95 (mm) | TBD |
+| Surface Dice | TBD |
+
+*Baseline results are not yet recorded; populate after a controlled baseline run.*
 
 ## Project structure and documentation
 
