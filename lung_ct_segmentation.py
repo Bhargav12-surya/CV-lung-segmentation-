@@ -2250,6 +2250,8 @@ def validate_train_args(args):
         raise UserError("Prespecified threshold must be between zero and one.")
     if args.surface_tolerance_mm <= 0:
         raise UserError("Surface tolerance must be positive.")
+    if getattr(args, "val_min_volume_ml", 0.) < 0:
+        raise UserError("Validation min volume must be non-negative.")
     if args.warmup_epochs < 0 or args.early_stopping_checks < 0 or args.clip_grad <= 0:
         raise UserError("Warmup/early-stopping counts must be nonnegative; gradient clipping must be positive.")
     for key in ("lr", "weight_decay", "clip_grad", "foreground_probability", "lambda_ds", "lambda_boundary",
@@ -2516,7 +2518,9 @@ def train_command(args):
                 LOGGER.info("Full-volume validation (%d cases)", len(validation_records))
                 val_rows = evaluate_records(model, validation_records, base, stats, patch, args.overlap,
                     args.threshold, args.surface_tolerance_mm, device, precision, output=None,
-                    metadata_control=args.metadata_control, accumulator_dir=args.accumulator_dir)
+                    metadata_control=args.metadata_control, accumulator_dir=args.accumulator_dir,
+                    postprocessing=postprocessing_recipe(getattr(args, "val_postprocessing", "none"),
+                                                         getattr(args, "val_min_volume_ml", 0.)))
                 summary = bootstrap_summary(val_rows, args.seed, repeats=200)
                 validation_dir = run / "validation" / f"epoch_{epoch + 1:04d}"
                 atomic_json(validation_dir / "patient_metrics.json", val_rows)
@@ -4205,6 +4209,10 @@ def add_train_arguments(parser):
     parser.add_argument("--early-stopping-checks", type=int, default=0, help="0 disables; count validation checks, not epochs.")
     parser.add_argument("--overlap", type=float, default=.5)
     parser.add_argument("--threshold", type=float, default=.5, help="Prespecified operating point; optional later validation-only selection.")
+    parser.add_argument("--val-postprocessing", choices=("none", "largest", "min-volume"), default="none",
+                        help="Optional validation postprocessing mode for checkpoint selection.")
+    parser.add_argument("--val-min-volume-ml", type=float, default=0.,
+                        help="Physical cutoff volume in mL for min-volume validation postprocessing.")
     parser.add_argument("--surface-tolerance-mm", type=float, default=2.)
     parser.add_argument("--accumulator-dir", help="Optional scratch disk for CPU sliding-window accumulation arrays.")
     parser.add_argument("--resume", help="Original run/checkpoints/last.pt; scientific settings are restored and validated.")

@@ -131,7 +131,8 @@ overlap; 1 means perfect overlap**. It is not classification accuracy.
 | --- | ---: | ---: |
 | Mean patient Dice, threshold 0.50 | 0.3563 | **0.3774** |
 | Mean patient Dice, validation-selected threshold 0.98 | 0.4648 | **0.4761** |
-| Completely missed targets, threshold 0.98 | 7 / 83 | 7 / 83 |
+| Zero-overlap cases ($Dice = 0.0$), threshold 0.98 | 7 / 83 | 7 / 83 |
+| Empty predictions ($P = 0$), threshold 0.98 | 0 / 83 | 0 / 83 |
 
 No component removal was applied to these rows. The corrected run uses corrected
 training-only acquisition statistics and a mixed sampler: 50% foreground-centred,
@@ -148,9 +149,8 @@ established. Its boundary metrics are slightly worse.
 
 - The 0.98 threshold was selected on validation. Its higher score reflects an
   operating-point change, not additional learning or an independent test result.
-- The corrected model completely misses 5 targets at 0.50 and 7 at 0.98.
-- Keeping only the largest component raises corrected Dice to 0.4947 but increases
-  completely missed targets to **23/83**. It is not recommended as a default.
+- The corrected model produces zero geometric overlap ($TP = 0$) in 5 cases at 0.50 and 7 cases at 0.98; empty predictions ($P = 0$) occur in 0 / 83 cases.
+- In contrast to the flawed "largest-component-only" rule (which raised Dice to 0.4947 but dropped 23 lesions), physical component volume filtering (`min-volume` at 2.0 mL) elevates Mean Dice to **0.4945** while dropping only 3 small $< 2$ mL lesions; setting the cutoff to 0.5 mL achieves **0 completely empty predictions**.
 - A historical test evaluation recorded Dice **0.4217** at its frozen 0.98
   threshold. **No corrected-model test result is reported.** Do not use the
   historical test results to choose new settings.
